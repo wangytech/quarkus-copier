@@ -1,0 +1,9 @@
+name: Quarkus Copier
+description: Generate Copier Class
+metadata:
+  keywords:
+    - quarkus-copier bean-copier
+#  guide: ... # To create and publish this guide, see https://github.com/quarkiverse/quarkiverse/wiki#documenting-your-extension
+#  categories:
+#    - "miscellaneous"
+  status: "preview"
