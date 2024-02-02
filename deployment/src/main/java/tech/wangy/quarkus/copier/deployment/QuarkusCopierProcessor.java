@@ -8,6 +8,7 @@ import io.quarkus.deployment.annotations.Record;
 import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
 import io.quarkus.deployment.builditem.FeatureBuildItem;
 import io.quarkus.deployment.builditem.GeneratedClassBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.ReflectiveClassBuildItem;
 import jakarta.inject.Inject;
 import javassist.*;
 import org.jboss.jandex.*;
@@ -121,7 +122,6 @@ class QuarkusCopierProcessor {
                 }
             }
             for (String to : values) {
-
                 copierBuildItemBuildProducer.produce(
                         new CopierBuildItem(from, to)
                 );
@@ -131,7 +131,31 @@ class QuarkusCopierProcessor {
                     );
                 }
             }
-
+        }
+        anno = indexBuildItem.getComputingIndex().getAnnotations(DotName.createSimple(CopyFrom.class));
+        for (AnnotationInstance ai : anno) {
+            List<String> values = null;
+            boolean reversible = true;
+            String to = ai.target().asClass().name().toString();
+            for (AnnotationValue av : ai.values()) {
+                if ("value".equals(av.name())) {
+                    values = av.asArrayList().stream().map(
+                            AnnotationValue::asClass
+                    ).map(Type::name).map(DotName::toString).collect(Collectors.toList());
+                } else if ("reversible".equals(av.name())) {
+                    reversible = av.asBoolean();
+                }
+            }
+            for (String from : values) {
+                copierBuildItemBuildProducer.produce(
+                        new CopierBuildItem(from, to)
+                );
+                if (reversible) {
+                    copierBuildItemBuildProducer.produce(
+                            new CopierBuildItem(to, from)
+                    );
+                }
+            }
         }
         anno = indexBuildItem.getComputingIndex().getAnnotations(DotName.createSimple(Inject.class));
         DotName copier = DotName.createSimple(Copier.class);
@@ -169,7 +193,7 @@ class QuarkusCopierProcessor {
                                   List<CopierBuildItem> copierBuildItems,
                                   BuildProducer<GeneratedClassBuildItem> generatedClassBuildItemBuildProducer,
                                   BuildProducer<RegisteredCopierBuildItem> registeredCopierBuildItemBuildProducer,
-
+                                  BuildProducer<ReflectiveClassBuildItem> reflectiveClassBuildItemBuildProducer,
                                   CopierConf conf
 
     ) {
@@ -192,6 +216,16 @@ class QuarkusCopierProcessor {
                     ).forEach(
                             registeredCopierBuildItemBuildProducer::produce
                     );
+            generatedClassBuildItems.stream()
+                    .filter(CopierGeneratedClassBuildItem::isCopier)
+                    .map(CopierGeneratedClassBuildItem::getName)
+                    .map(
+                            c ->
+                                    ReflectiveClassBuildItem.builder(c).constructors(true).build()
+                    ).forEach(
+                            reflectiveClassBuildItemBuildProducer::produce
+                    );
+
             if (conf.export.isPresent()) {
                 File root = new File(conf.export.get()).getAbsoluteFile();
                 LOG.info(String.format("写入生成的类到: %s", root));
@@ -225,7 +259,16 @@ class QuarkusCopierProcessor {
         Map<String, Map<String, String>> convertors = new HashMap<>();
         int i = 0;
         try {
-            CtClass ctClass = pool.makeClass(CONVERTOR);
+            CtClass ctClass = pool.getOrNull(CONVERTOR);
+            if (ctClass == null) {
+                ctClass = pool.makeClass(CONVERTOR);
+            } else {
+                generatedClassBuildItems.add(
+                        new CopierGeneratedClassBuildItem(false, CONVERTOR, ctClass.toBytecode())
+                );
+                LOG.warn("可能是Dev模式重载了类,不再自动编译Convertors类");
+                return convertors;
+            }
             CtConstructor constructor = new CtConstructor(new CtClass[]{}, ctClass);
             constructor.setBody("{}");
             constructor.setModifiers(Modifier.PRIVATE);
@@ -261,8 +304,18 @@ class QuarkusCopierProcessor {
                         );
 
                         if (Modifier.isPublic(convMethod.getModifiers())) {
-
-                            fieldType = pool.makeClass(CONVERTOR + "_" + fieldName);
+                            fieldType = pool.getOrNull(CONVERTOR + "_" + fieldName);
+                            if (fieldType == null) {
+                                fieldType = pool.makeClass(CONVERTOR + "_" + fieldName);
+                            } else {
+                                generatedClassBuildItems.add(
+                                        new CopierGeneratedClassBuildItem(false, CONVERTOR, ctClass.toBytecode())
+                                );
+                                LOG.warn(
+                                        String.format("可能是Dev模式重载了类,不再自动编译Copier类:%s", CONVERTOR + "_" + fieldName)
+                                );
+                                continue;
+                            }
                             fieldType.setInterfaces(new CtClass[]{convertor});
                             CtMethod convert = new CtMethod(
                                     pool.get(copierConvertorBuildItem.getTo()),
@@ -324,6 +377,7 @@ class QuarkusCopierProcessor {
                                 List<CopierGeneratedClassBuildItem> generatedClassBuildItems) {
 
         for (CopierBuildItem item : copierBuildItems) {
+            LOG.debug(String.format("创建复制类:%s -> %s", item.getFrom(), item.getTo()));
             String from = item.getFrom();
             String to = item.getTo();
 
@@ -332,7 +386,9 @@ class QuarkusCopierProcessor {
             if (cc == null) {
                 try {
                     CtClass copier = pool.get(Copier.class.getName());
+
                     cc = pool.makeClass(clsName);
+
                     cc.setModifiers(Modifier.PUBLIC);
 
                     cc.setInterfaces(new CtClass[]{copier});
@@ -344,7 +400,8 @@ class QuarkusCopierProcessor {
                     CtClass fc = pool.get(from);
                     CtClass tc = pool.get(to);
                     List<CtMethod> getters = new LinkedList<>();
-                    for (CtMethod method : fc.getDeclaredMethods()) {
+
+                    for (CtMethod method : getDeclaredMethods(fc)) {
                         if (method.getParameterTypes().length == 0
                                 && (method.getName().startsWith("is") || method.getName().startsWith("get"))
                         ) {
@@ -353,7 +410,7 @@ class QuarkusCopierProcessor {
                     }
                     Map<String, CtMethod> setters = new HashMap<>();
 
-                    for (CtMethod method : tc.getDeclaredMethods()) {
+                    for (CtMethod method : getDeclaredMethods(tc)) {
                         if (method.getName().startsWith("set")
                                 && method.getParameterTypes().length == 1
                         ) {
@@ -406,11 +463,16 @@ class QuarkusCopierProcessor {
                         }
 
                     }
-                    body.append("}}");
+                    body.append("}return $2;}");
                     CtMethod method = copier.getDeclaredMethod("copy");
                     method = CtNewMethod.copy(method, cc, null);
                     method.setModifiers(Modifier.PUBLIC);
                     method.setBody(body.toString());
+                    cc.addMethod(method);
+                    method = copier.getDeclaredMethod("newTo");
+                    method = CtNewMethod.copy(method, cc, null);
+                    method.setModifiers(Modifier.PUBLIC);
+                    method.setBody(String.format("{return new %s();}", to));
                     cc.addMethod(method);
                     byte[] clsBytes = cc.toBytecode();
 
@@ -419,8 +481,33 @@ class QuarkusCopierProcessor {
                 } catch (Throwable e) {
                     throw new RuntimeException(e);
                 }
+            } else {
+                try {
+                    generatedClassBuildItems
+                            .add(new CopierGeneratedClassBuildItem(true, clsName, cc.toBytecode()));
+                } catch (Throwable e) {
+                    throw new RuntimeException(e);
+                }
+                LOG.warn(
+                        String.format("可能是Dev模式重载了类,不再自动编译Copier类:%s", clsName)
+                );
+
             }
         }
+    }
+
+    private Iterable<CtMethod> getDeclaredMethods(CtClass fc) {
+        List<CtMethod> list = new LinkedList<>();
+        while (fc != null) {
+            list.addAll(Arrays.asList(fc.getDeclaredMethods()));
+            try {
+                fc = fc.getSuperclass();
+            } catch (NotFoundException e) {
+                break;
+            }
+        }
+        return list;
+
     }
 
     private String methodName(CtMethod method) {

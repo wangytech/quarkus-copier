@@ -6,7 +6,7 @@ import io.quarkus.runtime.annotations.ConfigRoot;
 
 import java.util.Optional;
 
-@ConfigRoot(prefix = "quarkus.copier", phase = ConfigPhase.BUILD_TIME)
+@ConfigRoot(prefix = "", phase = ConfigPhase.BUILD_TIME)
 public class CopierConf {
     /**
      * export copier class to this path
